@@ -131,6 +131,111 @@ BEGIN TRANSACTION;
 
 COMMIT;
 
+
+
+
+-- ========================================================================
+-- 3. BUSINESS KPI QUERIES
+-- ========================================================================
+
+-- KPI: Total Revenue (Only from Shipped or Delivered orders)
+SELECT 'Total Revenue (Shipped/Delivered)' AS "KPI",
+       SUM("total_amount") AS "Value",
+       'USD' AS "Currency"
+FROM "orders"
+WHERE "status" IN ('Shipped', 'Delivered');
+
+-- KPI: Top 10 Customers by Total Spending
+SELECT 'Top 10 Customers' AS "Category",
+       c."full_name" AS "Customer",
+       SUM(o."total_amount") AS "Total Spent",
+       COUNT(o."order_id") AS "Order Count"
+FROM "customers" c
+LEFT JOIN "orders" o ON c."customer_id" = o."customer_id"
+WHERE c."is_active" = true
+GROUP BY c."customer_id", c."full_name"
+ORDER BY "Total Spent" DESC
+LIMIT 10;
+
+-- KPI: Best-Selling Products (Top 5 by Quantity)
+SELECT 'Top 5 Products' AS "Category",
+       p."product_name",
+       p."category",
+       SUM(oi."quantity") AS "Total Quantity Sold",
+       SUM(oi."quantity" * oi."price_at_purchase") AS "Total Revenue"
+FROM "products" p
+LEFT JOIN "order_items" oi ON p."product_id" = oi."product_id"
+WHERE p."is_active" = true
+GROUP BY p."product_id", p."product_name", p."category"
+ORDER BY "Total Quantity Sold" DESC NULLS LAST
+LIMIT 5;
+
+-- KPI: Monthly Sales Trend
+SELECT TO_CHAR(o."order_date", 'YYYY-MM') AS "Month",
+       COUNT(o."order_id") AS "Order Count",
+       SUM(o."total_amount") AS "Monthly Revenue"
+FROM "orders" o
+WHERE o."status" IN ('Shipped', 'Delivered', 'Processing', 'Pending')
+GROUP BY TO_CHAR(o."order_date", 'YYYY-MM')
+ORDER BY "Month" DESC;
+
+-- KPI: Order Status Distribution
+SELECT o."status",
+       COUNT(*) AS "Count",
+       SUM(o."total_amount") AS "Total Amount",
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS "Percentage"
+FROM "orders" o
+GROUP BY o."status"
+ORDER BY "Count" DESC;
+
+
+-- ========================================================================
+-- 4. ANALYTICAL QUERIES (WINDOW FUNCTIONS)
+-- ========================================================================
+
+-- Query: Sales Rank by Category
+SELECT p."category",
+       p."product_name",
+       SUM(oi."quantity" * oi."price_at_purchase") AS "Category Revenue",
+       RANK() OVER (PARTITION BY p."category" ORDER BY SUM(oi."quantity" * oi."price_at_purchase") DESC) AS "Category Rank"
+FROM "products" p
+LEFT JOIN "order_items" oi ON p."product_id" = oi."product_id"
+WHERE p."is_active" = true
+GROUP BY p."category", p."product_id", p."product_name"
+ORDER BY p."category", "Category Rank";
+
+-- Query: Customer Order Frequency Analysis
+SELECT c."full_name" AS "Customer",
+       o."order_id",
+       o."order_date" AS "Current Order Date",
+       LAG(o."order_date") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date") AS "Previous Order Date",
+       EXTRACT(DAY FROM o."order_date" - LAG(o."order_date") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date")) AS "Days Since Last Order"
+FROM "customers" c
+JOIN "orders" o ON c."customer_id" = o."customer_id"
+ORDER BY c."customer_id", o."order_date";
+
+-- Query: Customer Spending Trend (Running Total)
+SELECT c."full_name" AS "Customer",
+       o."order_date",
+       o."total_amount",
+       SUM(o."total_amount") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date") AS "Running Total"
+FROM "customers" c
+JOIN "orders" o ON c."customer_id" = o."customer_id"
+ORDER BY c."customer_id", o."order_date";
+
+-- Query: Percentile Analysis (Top spending customers by percentile)
+SELECT c."full_name" AS "Customer",
+       SUM(o."total_amount") AS "Total Spending",
+       PERCENT_RANK() OVER (ORDER BY SUM(o."total_amount")) AS "Percentile Rank"
+FROM "customers" c
+LEFT JOIN "orders" o ON c."customer_id" = o."customer_id"
+GROUP BY c."customer_id", c."full_name"
+ORDER BY "Total Spending" DESC;
+
+
+
+
+
 -- ========================================================================
 -- 2. STORED PROCEDURES
 -- ========================================================================
@@ -331,65 +436,66 @@ $$;
 -- PROCEDURE: RestockInventory (With low stock alerts)
 -- Purpose: Replenish inventory with validation
 -- ========================================================================
-CREATE OR REPLACE PROCEDURE "RestockInventory"(
+CREATE OR REPLACE FUNCTION "RestockInventory"(
     p_product_id INT,
-    p_quantity_added INT,
-    OUT p_new_quantity INT,
-    OUT p_message VARCHAR
+    p_quantity_added INT
 )
+RETURNS TABLE(new_quantity INT, message TEXT)
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_product_name VARCHAR;
-    v_current_quantity INT;
+    v_product_name TEXT;
     v_reorder_level INT;
 BEGIN
-    p_message := NULL;
-    p_new_quantity := NULL;
 
-    BEGIN
-        -- Get product details
-        SELECT "product_name" INTO v_product_name
-        FROM "products"
-        WHERE "product_id" = p_product_id;
+    -- Get product
+    SELECT "product_name"
+    INTO v_product_name
+    FROM "products"
+    WHERE "product_id" = p_product_id;
 
-        IF v_product_name IS NULL THEN
-            RAISE EXCEPTION 'ERR_PRODUCT_NOT_FOUND: Product ID % does not exist', p_product_id;
-        END IF;
+    IF v_product_name IS NULL THEN
+        RETURN QUERY SELECT NULL, 'Product not found';
+        RETURN;
+    END IF;
 
-        -- Validate quantity
-        IF p_quantity_added <= 0 THEN
-            RAISE EXCEPTION 'ERR_INVALID_QUANTITY: Restock quantity must be positive';
-        END IF;
+    -- Validate quantity
+    IF p_quantity_added <= 0 THEN
+        RETURN QUERY SELECT NULL, 'Invalid quantity';
+        RETURN;
+    END IF;
 
-        -- Get current inventory
-        SELECT "quantity_on_hand", "reorder_level" INTO v_current_quantity, v_reorder_level
-        FROM "inventory"
-        WHERE "product_id" = p_product_id
-        FOR UPDATE;
+    -- Update inventory
+    UPDATE "inventory"
+    SET "quantity_on_hand" = "quantity_on_hand" + p_quantity_added,
+        "updated_at" = CURRENT_TIMESTAMP
+    WHERE "product_id" = p_product_id
+    RETURNING "quantity_on_hand" INTO new_quantity;
 
-        -- Update inventory
-        UPDATE "inventory"
-        SET "quantity_on_hand" = "quantity_on_hand" + p_quantity_added,
-            "updated_at" = CURRENT_TIMESTAMP
-        WHERE "product_id" = p_product_id
-        RETURNING "quantity_on_hand" INTO p_new_quantity;
+    -- Get reorder level
+    SELECT "reorder_level"
+    INTO v_reorder_level
+    FROM "inventory"
+    WHERE "product_id" = p_product_id;
 
-        -- Audit log
-        INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
-        VALUES ('inventory', 'UPDATE', p_product_id,
-                jsonb_build_object('quantity_on_hand', p_new_quantity, 'restocked', p_quantity_added));
+    -- Audit
+    INSERT INTO "audit_log" ("table_name","operation","record_id","new_values")
+    VALUES (
+        'inventory',
+        'UPDATE',
+        p_product_id,
+        jsonb_build_object('quantity_on_hand', new_quantity, 'restocked', p_quantity_added)
+    );
 
-        p_message := v_product_name || ': Restocked ' || p_quantity_added || ' units. New quantity: ' || p_new_quantity;
+    -- Build message
+    message := v_product_name || ': Restocked ' || p_quantity_added || ' units. New quantity: ' || new_quantity;
 
-        -- Alert if still below reorder level
-        IF p_new_quantity < v_reorder_level THEN
-            p_message := p_message || ' [WARNING: Still below reorder level of ' || v_reorder_level || ']';
-        END IF;
+    IF new_quantity < v_reorder_level THEN
+        message := message || ' [WARNING: still below reorder level]';
+    END IF;
 
-    EXCEPTION WHEN OTHERS THEN
-        p_message := 'Error restocking inventory: ' || SQLERRM;
-    END;
+    RETURN QUERY SELECT new_quantity, message;
+
 END;
 $$;
 
@@ -452,105 +558,6 @@ BEGIN
     END;
 END;
 $$;
-
-
--- ========================================================================
--- 3. BUSINESS KPI QUERIES
--- ========================================================================
-
--- KPI: Total Revenue (Only from Shipped or Delivered orders)
-SELECT 'Total Revenue (Shipped/Delivered)' AS "KPI",
-       SUM("total_amount") AS "Value",
-       'USD' AS "Currency"
-FROM "orders"
-WHERE "status" IN ('Shipped', 'Delivered');
-
--- KPI: Top 10 Customers by Total Spending
-SELECT 'Top 10 Customers' AS "Category",
-       c."full_name" AS "Customer",
-       SUM(o."total_amount") AS "Total Spent",
-       COUNT(o."order_id") AS "Order Count"
-FROM "customers" c
-LEFT JOIN "orders" o ON c."customer_id" = o."customer_id"
-WHERE c."is_active" = true
-GROUP BY c."customer_id", c."full_name"
-ORDER BY "Total Spent" DESC
-LIMIT 10;
-
--- KPI: Best-Selling Products (Top 5 by Quantity)
-SELECT 'Top 5 Products' AS "Category",
-       p."product_name",
-       p."category",
-       SUM(oi."quantity") AS "Total Quantity Sold",
-       SUM(oi."quantity" * oi."price_at_purchase") AS "Total Revenue"
-FROM "products" p
-LEFT JOIN "order_items" oi ON p."product_id" = oi."product_id"
-WHERE p."is_active" = true
-GROUP BY p."product_id", p."product_name", p."category"
-ORDER BY "Total Quantity Sold" DESC NULLS LAST
-LIMIT 5;
-
--- KPI: Monthly Sales Trend
-SELECT TO_CHAR(o."order_date", 'YYYY-MM') AS "Month",
-       COUNT(o."order_id") AS "Order Count",
-       SUM(o."total_amount") AS "Monthly Revenue"
-FROM "orders" o
-WHERE o."status" IN ('Shipped', 'Delivered', 'Processing', 'Pending')
-GROUP BY TO_CHAR(o."order_date", 'YYYY-MM')
-ORDER BY "Month" DESC;
-
--- KPI: Order Status Distribution
-SELECT o."status",
-       COUNT(*) AS "Count",
-       SUM(o."total_amount") AS "Total Amount",
-       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS "Percentage"
-FROM "orders" o
-GROUP BY o."status"
-ORDER BY "Count" DESC;
-
-
--- ========================================================================
--- 4. ANALYTICAL QUERIES (WINDOW FUNCTIONS)
--- ========================================================================
-
--- Query: Sales Rank by Category
-SELECT p."category",
-       p."product_name",
-       SUM(oi."quantity" * oi."price_at_purchase") AS "Category Revenue",
-       RANK() OVER (PARTITION BY p."category" ORDER BY SUM(oi."quantity" * oi."price_at_purchase") DESC) AS "Category Rank"
-FROM "products" p
-LEFT JOIN "order_items" oi ON p."product_id" = oi."product_id"
-WHERE p."is_active" = true
-GROUP BY p."category", p."product_id", p."product_name"
-ORDER BY p."category", "Category Rank";
-
--- Query: Customer Order Frequency Analysis
-SELECT c."full_name" AS "Customer",
-       o."order_id",
-       o."order_date" AS "Current Order Date",
-       LAG(o."order_date") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date") AS "Previous Order Date",
-       EXTRACT(DAY FROM o."order_date" - LAG(o."order_date") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date")) AS "Days Since Last Order"
-FROM "customers" c
-JOIN "orders" o ON c."customer_id" = o."customer_id"
-ORDER BY c."customer_id", o."order_date";
-
--- Query: Customer Spending Trend (Running Total)
-SELECT c."full_name" AS "Customer",
-       o."order_date",
-       o."total_amount",
-       SUM(o."total_amount") OVER (PARTITION BY c."customer_id" ORDER BY o."order_date") AS "Running Total"
-FROM "customers" c
-JOIN "orders" o ON c."customer_id" = o."customer_id"
-ORDER BY c."customer_id", o."order_date";
-
--- Query: Percentile Analysis (Top spending customers by percentile)
-SELECT c."full_name" AS "Customer",
-       SUM(o."total_amount") AS "Total Spending",
-       PERCENT_RANK() OVER (ORDER BY SUM(o."total_amount")) AS "Percentile Rank"
-FROM "customers" c
-LEFT JOIN "orders" o ON c."customer_id" = o."customer_id"
-GROUP BY c."customer_id", c."full_name"
-ORDER BY "Total Spending" DESC;
 
 
 -- ========================================================================
@@ -658,16 +665,20 @@ GROUP BY TO_CHAR(o."order_date", 'YYYY-MM')
 ORDER BY "Month" DESC;
 
 -- Query: Customer Churn Analysis (No orders in 60+ days)
-SELECT c."customer_id",
-       c."full_name",
-       c."email",
-       MAX(o."order_date") AS "Last Order Date",
-       EXTRACT(DAY FROM CURRENT_TIMESTAMP - MAX(o."order_date")) AS "Days Since Last Order"
+SELECT 
+    c."customer_id",
+    c."full_name",
+    c."email",
+    MAX(o."order_date") AS "Last Order Date",
+    EXTRACT(DAY FROM CURRENT_TIMESTAMP - MAX(o."order_date")) AS "Days Since Last Order"
 FROM "customers" c
-LEFT JOIN "orders" o ON c."customer_id" = o."customer_id"
-WHERE c."is_active" = true AND MAX(o."order_date") IS NOT NULL
+LEFT JOIN "orders" o 
+    ON c."customer_id" = o."customer_id"
+WHERE c."is_active" = true
 GROUP BY c."customer_id", c."full_name", c."email"
-HAVING EXTRACT(DAY FROM CURRENT_TIMESTAMP - MAX(o."order_date")) >= 60
+HAVING 
+    MAX(o."order_date") IS NOT NULL
+    AND EXTRACT(DAY FROM CURRENT_TIMESTAMP - MAX(o."order_date")) >= 60
 ORDER BY "Days Since Last Order" DESC;
 
 -- Query: Audit Log Summary
