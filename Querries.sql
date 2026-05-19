@@ -856,15 +856,37 @@ ORDER BY "Last Modified" DESC;
 -- ========================================================================
 
 -- Test: ProcessNewOrder (Success case)
--- SELECT * FROM "ProcessNewOrder"(1, 3, 2);
+
+
+-- SELECT * FROM "ProcessNewOrder"(
+--     2,
+--     '[
+--         {"product_id": 4,  "quantity": 2},
+--         {"product_id": 5, "quantity": 1},
+--         {"product_id": 3,  "quantity": 5}
+--     ]'::JSONB
+-- );
 
 -- Test: ProcessNewOrder (Insufficient stock)
--- SELECT * FROM "UpdateProductPrice"(1, 1499.99);
+
+-- SELECT * FROM "ProcessNewOrder"(
+--     2,
+--     '[{"product_id": 4, "quantity": 99}]'::JSONB
+-- );
 
 -- Test: ProcessNewOrder (Invalid customer)
--- SELECT * FROM "UpdateProductPrice"(90, 1499.99);
+
+
+-- SELECT * FROM "ProcessNewOrder"(
+--     9999,
+--     '[{"product_id": 4, "quantity": 2}]'::JSONB
+-- );
+
 
 -- Test: UpdateProductPrice (Success)
+-- SELECT * FROM "UpdateProductPrice"(2, 50);
+
+-- Test: UpdateProductPrice (Fail)
 -- SELECT * FROM "UpdateProductPrice"(2, -10);
 
 -- Test: RestockInventory (Success)
@@ -872,3 +894,17 @@ ORDER BY "Last Modified" DESC;
 
 -- Test: CancelOrder (Success)
 -- CALL "CancelOrder"(1, NULL, NULL);
+
+-- Test: Checking what was written in audit table in the last 10 mins
+
+-- SELECT
+--     "audit_id",
+--     "table_name",
+--     "operation",
+--     "record_id",
+--     "new_values",
+--     "user_name",
+--     "created_at"
+-- FROM "audit_log"
+-- WHERE "created_at" >= NOW() - INTERVAL '10 minutes'
+-- ORDER BY "created_at" DESC;
