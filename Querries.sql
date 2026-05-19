@@ -241,133 +241,292 @@ ORDER BY "Total Spending" DESC;
 -- ========================================================================
 
 -- ========================================================================
--- PROCEDURE: ProcessNewOrder (Complete version with error handling)
--- Purpose: Create a new order with inventory validation and transaction safety
--- Parameters: p_customer_id, p_product_id, p_quantity
--- Returns: p_order_id (success) or error
+-- PROCEDURE: ProcessNewOrder (Production version)
+-- Purpose:   Atomically create a multi-item order with full inventory management.
+--            Validates customer and each product line, acquires row-level locks on
+--            inventory to prevent overselling, writes all order records, and logs
+--            every operation to audit_log. Rolls back entirely on any failure.
+--
+-- Parameters:
+--   p_customer_id  INT   -- ID of the placing customer (must be active)
+--   p_order_items  JSONB -- Array of line items, e.g.:
+--                           '[{"product_id": 4, "quantity": 2},
+--                             {"product_id": 5, "quantity": 1}]'
+--
+-- Returns TABLE:
+--   result_order_id      INT  -- Populated on success; NULL on failure
+--   result_error_message TEXT -- NULL on success; error code on failure
+--
+-- Error codes:
+--   ERR_NO_ITEMS           -- JSONB array is null, not an array, or empty
+--   ERR_INVALID_CUSTOMER   -- customer_id not found or inactive
+--   ERR_MALFORMED_ITEM     -- a line item is missing product_id or quantity
+--   ERR_INVALID_QUANTITY   -- quantity <= 0 or > 10000
+--   ERR_INVALID_PRODUCT    -- product_id does not exist
+--   ERR_PRODUCT_INACTIVE   -- product exists but is_active = false
+--   ERR_NO_INVENTORY       -- no inventory row found for product
+--   ERR_INSUFFICIENT_STOCK -- quantity_on_hand < requested quantity
+--   ERR_UNEXPECTED         -- unhandled exception (see audit_log for details)
+--
+-- Audit trail:
+--   Writes to audit_log for every exit path (success and all error codes).
+--   On success: 1 orders row + N order_items rows + N inventory rows = 2N+1 entries.
+--
+-- Usage:
+--   SELECT * FROM "ProcessNewOrder"(
+--       2,
+--       '[{"product_id": 4, "quantity": 2}, {"product_id": 5, "quantity": 1}]'::JSONB
+--   );
 -- ========================================================================
+
+
+-- ============================================================
+-- Create composite type first (run once)
+-- ============================================================
+CREATE TYPE line_rec AS (
+    product_id         INT,
+    quantity           INT,
+    price_at_purchase  DECIMAL(10,2),
+    line_total         DECIMAL(10,2)
+);
+
+-- ============================================================
+-- Function
+-- ============================================================
+
 CREATE OR REPLACE FUNCTION "ProcessNewOrder"(
-    p_customer_id INT,
-    p_product_id INT,
-    p_quantity INT
+    p_customer_id  INT,
+    p_order_items  JSONB
 )
 RETURNS TABLE (
-    result_order_id INT,
-    result_error_message VARCHAR
+    result_order_id      INT,
+    result_error_message TEXT
 )
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_stock INT;
-    v_price DECIMAL(10,2);
-    v_customer_exists BOOLEAN;
-    v_product_active BOOLEAN;
-    v_total_amount DECIMAL(10,2);
+    v_customer_exists  BOOLEAN;
+    v_order_id         INT;
+    v_item             JSONB;
+    v_product_id       INT;
+    v_quantity         INT;
+    v_is_active        BOOLEAN;
+    v_price            DECIMAL(10,2);
+    v_stock            INT;
+    v_total_amount     DECIMAL(10,2) := 0;
+    v_lines            JSONB := '[]'::JSONB;
 BEGIN
-    result_order_id := NULL;
-    result_error_message := NULL;
+    -- --------------------------------------------------------
+    -- 1. Input guard
+    -- --------------------------------------------------------
+    IF p_order_items IS NULL
+       OR jsonb_typeof(p_order_items) <> 'array'
+       OR jsonb_array_length(p_order_items) = 0 THEN
 
-    -- Validate customer
+        INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+        VALUES ('orders', 'INSERT', p_customer_id,
+                jsonb_build_object('error', 'ERR_NO_ITEMS',
+                                   'customer_id', p_customer_id));
+        result_error_message := 'ERR_NO_ITEMS';
+        RETURN NEXT; RETURN;
+    END IF;
+
+    -- --------------------------------------------------------
+    -- 2. Validate customer
+    -- --------------------------------------------------------
     SELECT EXISTS (
-        SELECT 1
-        FROM "customers"
+        SELECT 1 FROM "customers"
         WHERE "customer_id" = p_customer_id
-          AND "is_active" = true
+          AND "is_active"   = true
     ) INTO v_customer_exists;
 
     IF NOT v_customer_exists THEN
+        INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+        VALUES ('orders', 'INSERT', p_customer_id,
+                jsonb_build_object('error', 'ERR_INVALID_CUSTOMER',
+                                   'customer_id', p_customer_id));
         result_error_message := 'ERR_INVALID_CUSTOMER';
-        RETURN NEXT;
-        RETURN;
+        RETURN NEXT; RETURN;
     END IF;
 
-    -- Validate product
-    SELECT "is_active"
-    INTO v_product_active
-    FROM "products"
-    WHERE "product_id" = p_product_id;
+    -- --------------------------------------------------------
+    -- 3. Validate and lock every line item
+    --    Step A: read product (price + active status) — no lock needed,
+    --            products rows are reference data not concurrently mutated
+    --    Step B: lock the inventory row with FOR UPDATE to prevent
+    --            concurrent overselling (avoids LEFT JOIN FOR UPDATE error)
+    -- --------------------------------------------------------
+    FOR v_item IN SELECT value FROM jsonb_array_elements(p_order_items) LOOP
 
-    IF v_product_active IS NULL THEN
-        result_error_message := 'ERR_INVALID_PRODUCT';
-        RETURN NEXT;
-        RETURN;
-    ELSIF NOT v_product_active THEN
-        result_error_message := 'ERR_PRODUCT_INACTIVE';
-        RETURN NEXT;
-        RETURN;
-    END IF;
+        v_product_id := (v_item->>'product_id')::INT;
+        v_quantity   := (v_item->>'quantity')::INT;
 
-    -- Validate quantity
-    IF p_quantity <= 0 THEN
-        result_error_message := 'ERR_INVALID_QUANTITY';
-        RETURN NEXT;
-        RETURN;
-    END IF;
+        -- Malformed element check
+        IF v_product_id IS NULL OR v_quantity IS NULL THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error', 'ERR_MALFORMED_ITEM', 'item', v_item));
+            result_error_message := 'ERR_MALFORMED_ITEM';
+            RETURN NEXT; RETURN;
+        END IF;
 
-    -- Get price
-    SELECT "price"
-    INTO v_price
-    FROM "products"
-    WHERE "product_id" = p_product_id;
+        -- Quantity bounds
+        IF v_quantity <= 0 OR v_quantity > 10000 THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error', 'ERR_INVALID_QUANTITY',
+                                       'product_id', v_product_id,
+                                       'quantity',   v_quantity));
+            result_error_message := 'ERR_INVALID_QUANTITY';
+            RETURN NEXT; RETURN;
+        END IF;
 
-    -- Check stock
-    SELECT "quantity_on_hand"
-    INTO v_stock
-    FROM "inventory"
-    WHERE "product_id" = p_product_id
-    FOR UPDATE;
+        -- Step A: validate product exists and is active, fetch price
+        SELECT "is_active", "price"
+        INTO   v_is_active, v_price
+        FROM   "products"
+        WHERE  "product_id" = v_product_id;
 
-    IF v_stock IS NULL THEN
-        result_error_message := 'ERR_NO_INVENTORY';
-        RETURN NEXT;
-        RETURN;
-    ELSIF v_stock < p_quantity THEN
-        result_error_message := 'ERR_INSUFFICIENT_STOCK';
-        RETURN NEXT;
-        RETURN;
-    END IF;
+        IF NOT FOUND THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error', 'ERR_INVALID_PRODUCT',
+                                       'product_id', v_product_id));
+            result_error_message := 'ERR_INVALID_PRODUCT';
+            RETURN NEXT; RETURN;
+        END IF;
 
-    v_total_amount := v_price * p_quantity;
+        IF NOT v_is_active THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error', 'ERR_PRODUCT_INACTIVE',
+                                       'product_id', v_product_id));
+            result_error_message := 'ERR_PRODUCT_INACTIVE';
+            RETURN NEXT; RETURN;
+        END IF;
 
-    -- Create order
+        -- Step B: lock the inventory row exclusively, then check stock
+        SELECT "quantity_on_hand"
+        INTO   v_stock
+        FROM   "inventory"
+        WHERE  "product_id" = v_product_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error', 'ERR_NO_INVENTORY',
+                                       'product_id', v_product_id));
+            result_error_message := 'ERR_NO_INVENTORY';
+            RETURN NEXT; RETURN;
+        END IF;
+
+        IF v_stock < v_quantity THEN
+            INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+            VALUES ('orders', 'INSERT', p_customer_id,
+                    jsonb_build_object('error',      'ERR_INSUFFICIENT_STOCK',
+                                       'product_id', v_product_id,
+                                       'requested',  v_quantity,
+                                       'on_hand',    v_stock));
+            result_error_message := 'ERR_INSUFFICIENT_STOCK';
+            RETURN NEXT; RETURN;
+        END IF;
+
+        -- Accumulate validated line
+        v_lines        := v_lines || jsonb_build_object(
+                              'product_id',        v_product_id,
+                              'quantity',          v_quantity,
+                              'price_at_purchase', v_price,
+                              'line_total',        ROUND(v_price * v_quantity::NUMERIC, 2)
+                          );
+        v_total_amount := v_total_amount + ROUND(v_price * v_quantity::NUMERIC, 2);
+    END LOOP;
+
+    -- --------------------------------------------------------
+    -- 4. All items validated and locked — write order header
+    -- --------------------------------------------------------
     INSERT INTO "orders" (
-        "customer_id",
-        "order_date",
-        "total_amount",
-        "status"
+        "customer_id", "order_date", "total_amount", "status"
+    ) VALUES (
+        p_customer_id, CURRENT_TIMESTAMP, v_total_amount, 'Pending'
     )
-    VALUES (
-        p_customer_id,
-        CURRENT_TIMESTAMP,
-        v_total_amount,
-        'Pending'
-    )
-    RETURNING "order_id" INTO result_order_id;
+    RETURNING "order_id" INTO v_order_id;
 
-    -- Create order item
-    INSERT INTO "order_items" (
-        "order_id",
-        "product_id",
-        "quantity",
-        "price_at_purchase"
-    )
-    VALUES (
-        result_order_id,
-        p_product_id,
-        p_quantity,
-        v_price
-    );
+    INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values", "user_name")
+    VALUES ('orders', 'INSERT', v_order_id,
+            jsonb_build_object('customer_id',  p_customer_id,
+                               'total_amount', v_total_amount,
+                               'status',       'Pending'),
+            current_user);
 
-    -- Update inventory
-    UPDATE "inventory"
-    SET "quantity_on_hand" = "quantity_on_hand" - p_quantity,
-        "updated_at" = CURRENT_TIMESTAMP
-    WHERE "product_id" = p_product_id;
+    -- --------------------------------------------------------
+    -- 5. Write order items and decrement inventory
+    -- --------------------------------------------------------
+    FOR v_item IN SELECT value FROM jsonb_array_elements(v_lines) LOOP
 
+        v_product_id := (v_item->>'product_id')::INT;
+        v_quantity   := (v_item->>'quantity')::INT;
+        v_price      := (v_item->>'price_at_purchase')::DECIMAL(10,2);
+
+        INSERT INTO "order_items" (
+            "order_id", "product_id", "quantity", "price_at_purchase"
+        ) VALUES (
+            v_order_id, v_product_id, v_quantity, v_price
+        );
+
+        INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values", "user_name")
+        VALUES ('order_items', 'INSERT', v_order_id,
+                jsonb_build_object('product_id', v_product_id,
+                                   'quantity',   v_quantity,
+                                   'price',      v_price),
+                current_user);
+
+        UPDATE "inventory"
+        SET    "quantity_on_hand" = "quantity_on_hand" - v_quantity,
+               "updated_at"       = CURRENT_TIMESTAMP
+        WHERE  "product_id"       = v_product_id;
+
+        INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values", "user_name")
+        VALUES ('inventory', 'UPDATE', v_product_id,
+                jsonb_build_object('product_id',   v_product_id,
+                                   'qty_deducted', v_quantity,
+                                   'order_id',     v_order_id),
+                current_user);
+    END LOOP;
+
+    -- --------------------------------------------------------
+    -- 6. Return success
+    -- --------------------------------------------------------
+    result_order_id := v_order_id;
     RETURN NEXT;
+
+EXCEPTION WHEN OTHERS THEN
+    INSERT INTO "audit_log" ("table_name", "operation", "record_id", "new_values")
+    VALUES ('orders', 'INSERT', p_customer_id,
+            jsonb_build_object('error',       'ERR_UNEXPECTED',
+                               'sqlstate',    SQLSTATE,
+                               'message',     SQLERRM,
+                               'customer_id', p_customer_id));
+    RAISE;
 END;
 $$;
 
+SELECT * FROM "ProcessNewOrder"(
+    2,
+    '[
+        {"product_id": 4,  "quantity": 2},
+        {"product_id": 5, "quantity": 1},
+        {"product_id": 3,  "quantity": 5}
+    ]'::JSONB
+);
+
+SELECT * FROM "ProcessNewOrder"(
+    1,
+    '[
+        {"product_id": 2, "quantity": 3},
+        {"product_id": 5, "quantity": 1}
+    ]'::JSONB
+);
 
 -- ========================================================================
 -- PROCEDURE: UpdateProductPrice (With audit logging)
