@@ -279,7 +279,6 @@ ORDER BY "Total Spending" DESC;
 --   );
 -- ========================================================================
 
-
 -- ============================================================
 -- Create composite type first (run once)
 -- ============================================================
@@ -511,22 +510,7 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-SELECT * FROM "ProcessNewOrder"(
-    2,
-    '[
-        {"product_id": 4,  "quantity": 2},
-        {"product_id": 5, "quantity": 1},
-        {"product_id": 3,  "quantity": 5}
-    ]'::JSONB
-);
 
-SELECT * FROM "ProcessNewOrder"(
-    1,
-    '[
-        {"product_id": 2, "quantity": 3},
-        {"product_id": 5, "quantity": 1}
-    ]'::JSONB
-);
 
 -- ========================================================================
 -- PROCEDURE: UpdateProductPrice (With audit logging)
@@ -864,6 +848,14 @@ ORDER BY "Last Modified" DESC;
 --         {"product_id": 4,  "quantity": 2},
 --         {"product_id": 5, "quantity": 1},
 --         {"product_id": 3,  "quantity": 5}
+--     ]'::JSONB
+-- );
+
+-- SELECT * FROM "ProcessNewOrder"(
+--     1,
+--     '[
+--         {"product_id": 2, "quantity": 3},
+--         {"product_id": 5, "quantity": 1}
 --     ]'::JSONB
 -- );
 
